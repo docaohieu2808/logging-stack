@@ -1,0 +1,76 @@
+# Vector L1: Basic pipeline — read log file, print to console
+# Docs: https://vector.dev/docs/
+# Run: vector --config vector-file-to-console.toml
+
+[api]
+enabled = true
+address = "0.0.0.0:8686"
+
+# --- SOURCES ---
+
+# Read from a log file
+[sources.app_logs]
+type = "file"
+include = ["/var/log/app/*.log"]
+read_from = "beginning"
+ignore_older_secs = 86400       # ignore files older than 24h
+fingerprint.strategy = "checksum"
+fingerprint.lines = 1
+
+# Read Docker container logs
+[sources.docker_logs]
+type = "docker_logs"
+include_containers = []         # empty = all containers
+include_labels = {}
+exclude_containers = ["vector"] # avoid self-collection
+
+# --- TRANSFORMS ---
+
+# Parse JSON log lines from app
+[transforms.parse_app_json]
+type = "remap"
+inputs = ["app_logs"]
+source = '''
+  # Attempt to parse message as JSON
+  parsed, err = parse_json(.message)
+  if err == null {
+    . = merge(., parsed)
+    del(.message)
+  }
+
+  # Normalize log level field name
+  if exists(.level) {
+    .log_level = downcase(string!(.level))
+    del(.level)
+  } else if exists(.severity) {
+    .log_level = downcase(string!(.severity))
+    del(.severity)
+  } else {
+    .log_level = "unknown"
+  }
+
+  # Add pipeline metadata
+  .vector_pipeline = "file-to-console"
+  .host = get_hostname!()
+'''
+
+# Pass-through transform for docker logs (already structured)
+[transforms.enrich_docker]
+type = "remap"
+inputs = ["docker_logs"]
+source = '''
+  .source_type = "docker"
+  .host = get_hostname!()
+  .vector_pipeline = "file-to-console"
+'''
+
+# --- SINKS ---
+
+# Print all events to console (stdout) — useful for debugging
+[sinks.console_out]
+type = "console"
+inputs = ["parse_app_json", "enrich_docker"]
+target = "stdout"
+
+[sinks.console_out.encoding]
+codec = "json"

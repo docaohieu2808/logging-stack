@@ -1,0 +1,51 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Docker volumes and runtime data
+volumes/
+data/
+
+# Elasticsearch data
+esdata*/
+
+# Logstash sincedb and data
+*.sincedb
+sincedb_*
+
+# Fluentd buffer and position files
+buffer/
+*.pos
+*.log.pos
+
+# Fluent Bit database files
+*.db
+*.db-shm
+*.db-wal
+
+# Vector runtime data
+vector_data/
+failed-*.ndjson
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Certificates and keys
+*.pem
+*.crt
+*.key
+*.p12
+*.jks

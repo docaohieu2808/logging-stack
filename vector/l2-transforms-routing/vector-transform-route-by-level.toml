@@ -1,0 +1,148 @@
+# Vector L2: Transform and route logs by log level
+# Routes: error/fatal → elasticsearch errors index
+#         warn        → elasticsearch warnings index
+#         info/debug  → elasticsearch general index
+#         all         → S3 archive
+# Docs: https://vector.dev/docs/reference/configuration/transforms/route/
+
+[api]
+enabled = true
+address = "0.0.0.0:8686"
+
+# --- SOURCES ---
+
+[sources.docker_logs]
+type = "docker_logs"
+include_containers = []
+exclude_containers = ["vector"]
+
+[sources.file_logs]
+type = "file"
+include = ["/var/log/app/*.log", "/var/log/services/*.log"]
+read_from = "end"
+fingerprint.strategy = "checksum"
+
+# --- TRANSFORMS ---
+
+# Step 1: Parse and normalize all incoming logs
+[transforms.normalize]
+type = "remap"
+inputs = ["docker_logs", "file_logs"]
+source = '''
+  # Parse JSON messages
+  if is_string(.message) {
+    parsed, err = parse_json(.message)
+    if err == null {
+      . = merge(., parsed)
+    }
+  }
+
+  # Normalize log level to lowercase string
+  level = null
+  if exists(.level)    { level = downcase(string!(.level)) }
+  if exists(.severity) { level = downcase(string!(.severity)) }
+  if exists(.lvl)      { level = downcase(string!(.lvl)) }
+
+  .log_level = level ?? "info"
+
+  # Map aliases to canonical levels
+  if .log_level == "err"      { .log_level = "error" }
+  if .log_level == "warning"  { .log_level = "warn" }
+  if .log_level == "critical" { .log_level = "fatal" }
+  if .log_level == "trace"    { .log_level = "debug" }
+
+  # Add metadata
+  .host = get_hostname!()
+  .ingest_ts = now()
+'''
+
+# Step 2: Route by log level
+[transforms.route_by_level]
+type = "route"
+inputs = ["normalize"]
+
+[transforms.route_by_level.route]
+errors   = '.log_level == "error" || .log_level == "fatal"'
+warnings = '.log_level == "warn"'
+info     = '.log_level == "info"'
+debug    = '.log_level == "debug"'
+# unmatched goes to _unmatched output
+
+# Step 3: Enrich error events with extra context
+[transforms.enrich_errors]
+type = "remap"
+inputs = ["route_by_level.errors"]
+source = '''
+  .alert = true
+  .requires_attention = true
+  # Extract stack trace if present
+  if exists(.stack_trace) {
+    .stack_trace_lines = split(string!(.stack_trace), "\n")
+  }
+'''
+
+# --- SINKS ---
+
+# Errors → dedicated ES index with high priority
+[sinks.es_errors]
+type = "elasticsearch"
+inputs = ["enrich_errors"]
+endpoints = ["http://elasticsearch:9200"]
+auth.strategy = "basic"
+auth.user = "${ES_USER:-elastic}"
+auth.password = "${ES_PASSWORD:-changeme}"
+bulk.index = "logs-errors-%Y.%m.%d"
+bulk.action = "index"
+
+[sinks.es_errors.encoding]
+except_fields = ["ingest_ts"]
+
+[sinks.es_errors.buffer]
+type = "disk"
+max_size = 268435456  # 256MB
+when_full = "block"
+
+# Warnings → warnings index
+[sinks.es_warnings]
+type = "elasticsearch"
+inputs = ["route_by_level.warnings"]
+endpoints = ["http://elasticsearch:9200"]
+auth.strategy = "basic"
+auth.user = "${ES_USER:-elastic}"
+auth.password = "${ES_PASSWORD:-changeme}"
+bulk.index = "logs-warnings-%Y.%m.%d"
+
+[sinks.es_warnings.encoding]
+except_fields = ["ingest_ts"]
+
+# Info + debug + unmatched → general index
+[sinks.es_general]
+type = "elasticsearch"
+inputs = ["route_by_level.info", "route_by_level.debug", "route_by_level._unmatched"]
+endpoints = ["http://elasticsearch:9200"]
+auth.strategy = "basic"
+auth.user = "${ES_USER:-elastic}"
+auth.password = "${ES_PASSWORD:-changeme}"
+bulk.index = "logs-general-%Y.%m.%d"
+
+[sinks.es_general.encoding]
+except_fields = ["ingest_ts"]
+
+# All logs → S3 for archival (batched by hour)
+[sinks.s3_archive]
+type = "aws_s3"
+inputs = ["normalize"]
+bucket = "${S3_BUCKET:-my-logs-archive}"
+region = "${AWS_REGION:-us-east-1}"
+key_prefix = "vector-logs/%Y/%m/%d/%H/"
+compression = "gzip"
+encoding.codec = "ndjson"
+
+[sinks.s3_archive.batch]
+max_bytes = 10485760   # 10MB per file
+timeout_secs = 3600    # flush every hour
+
+[sinks.s3_archive.buffer]
+type = "disk"
+max_size = 1073741824  # 1GB
+when_full = "drop_newest"

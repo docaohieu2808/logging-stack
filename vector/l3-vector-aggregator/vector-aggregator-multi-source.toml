@@ -1,0 +1,160 @@
+# Vector L3: Aggregator pattern — receives from multiple upstream Vector agents
+# Deploy as a central aggregator that upstream agents forward to via vector sink
+# Handles: deduplication, batching, fan-out to ES + S3 + metrics
+# Docs: https://vector.dev/docs/setup/deployment/roles/aggregator/
+
+[api]
+enabled = true
+address = "0.0.0.0:8686"
+
+# --- SOURCES ---
+
+# Receive from upstream Vector agents (edge collectors)
+[sources.vector_agents]
+type = "vector"
+address = "0.0.0.0:9000"
+version = "2"
+
+# Receive from Fluentd/Fluent Bit via syslog protocol
+[sources.syslog_in]
+type = "syslog"
+address = "0.0.0.0:5140"
+mode = "udp"
+
+# Receive structured logs via HTTP (from apps posting directly)
+[sources.http_in]
+type = "http_server"
+address = "0.0.0.0:8080"
+encoding = "json"
+path = "/ingest"
+method = "POST"
+
+# --- TRANSFORMS ---
+
+# Deduplicate events with same content within a 5-second window
+[transforms.deduplicate]
+type = "dedupe"
+inputs = ["vector_agents", "syslog_in", "http_in"]
+cache.num_events = 5000
+
+[transforms.deduplicate.fields]
+match = ["host", "message", "timestamp"]
+
+# Normalize and enrich all incoming events
+[transforms.enrich]
+type = "remap"
+inputs = ["deduplicate"]
+source = '''
+  # Tag the aggregator hop
+  .aggregator_host = get_hostname!()
+  .aggregated_at = now()
+
+  # Ensure log_level exists
+  if !exists(.log_level) {
+    if exists(.level)    { .log_level = downcase(string!(.level)) }
+    else if exists(.severity) { .log_level = downcase(string!(.severity)) }
+    else { .log_level = "info" }
+  }
+
+  # Normalise source_type label
+  if !exists(.source_type) {
+    .source_type = "unknown"
+  }
+
+  # Parse epoch timestamps if present
+  if exists(.ts) && is_integer(.ts) {
+    .timestamp = from_unix_timestamp!(int!(.ts))
+    del(.ts)
+  }
+'''
+
+# Aggregate metrics: count events per source per minute
+[transforms.aggregate_metrics]
+type = "log_to_metric"
+inputs = ["enrich"]
+
+[[transforms.aggregate_metrics.metrics]]
+type = "counter"
+field = "message"
+name = "log_events_total"
+namespace = "vector"
+
+[transforms.aggregate_metrics.metrics.tags]
+source_type = "{{source_type}}"
+log_level   = "{{log_level}}"
+host        = "{{host}}"
+
+# Throttle: drop excess events when downstream is overwhelmed
+[transforms.throttle]
+type = "throttle"
+inputs = ["enrich"]
+threshold = 10000
+window_secs = 1.0
+key_field = "host"
+
+# --- SINKS ---
+
+# Primary: Elasticsearch data stream
+[sinks.elasticsearch]
+type = "elasticsearch"
+inputs = ["throttle"]
+endpoints = ["http://elasticsearch:9200"]
+auth.strategy = "basic"
+auth.user = "${ES_USER:-elastic}"
+auth.password = "${ES_PASSWORD:-changeme}"
+mode = "data_stream"
+data_stream.type = "logs"
+data_stream.dataset = "aggregated"
+data_stream.namespace = "production"
+bulk.action = "create"
+
+[sinks.elasticsearch.encoding]
+except_fields = ["aggregated_at"]
+
+[sinks.elasticsearch.buffer]
+type = "disk"
+max_size = 536870912  # 512MB
+when_full = "block"
+
+[sinks.elasticsearch.request]
+concurrency = 5
+rate_limit_num = 100
+rate_limit_duration_secs = 1
+
+# S3 long-term archive (hourly partitioned)
+[sinks.s3_archive]
+type = "aws_s3"
+inputs = ["throttle"]
+bucket = "${S3_BUCKET:-logs-archive}"
+region = "${AWS_REGION:-us-east-1}"
+key_prefix = "aggregated/%Y/%m/%d/%H/{{ source_type }}/"
+compression = "gzip"
+encoding.codec = "ndjson"
+
+[sinks.s3_archive.batch]
+max_bytes = 52428800   # 50MB
+timeout_secs = 3600
+
+[sinks.s3_archive.buffer]
+type = "disk"
+max_size = 2147483648  # 2GB
+when_full = "drop_newest"
+
+# Prometheus metrics endpoint
+[sinks.prometheus_metrics]
+type = "prometheus_exporter"
+inputs = ["aggregate_metrics"]
+address = "0.0.0.0:9598"
+flush_period_secs = 60
+
+# Internal Vector health metrics to console (debug)
+[sources.internal_metrics]
+type = "internal_metrics"
+
+[sinks.internal_metrics_console]
+type = "console"
+inputs = ["internal_metrics"]
+target = "stderr"
+
+[sinks.internal_metrics_console.encoding]
+codec = "json"

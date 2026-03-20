@@ -1,0 +1,145 @@
+version: "3.8"
+
+services:
+  es01:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    container_name: es01
+    environment:
+      - node.name=es01
+      - cluster.name=elk-3node-cluster
+      - cluster.initial_master_nodes=es01,es02,es03
+      - discovery.seed_hosts=es02,es03
+      - ELASTIC_PASSWORD=changeme
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=false
+      - xpack.security.transport.ssl.enabled=false
+      - xpack.license.self_generated.type=basic
+      - bootstrap.memory_lock=true
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+      - node.roles=master,data,ingest
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - esdata01:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - elk-cluster
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -u elastic:changeme http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  es02:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    container_name: es02
+    environment:
+      - node.name=es02
+      - cluster.name=elk-3node-cluster
+      - cluster.initial_master_nodes=es01,es02,es03
+      - discovery.seed_hosts=es01,es03
+      - ELASTIC_PASSWORD=changeme
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=false
+      - xpack.security.transport.ssl.enabled=false
+      - xpack.license.self_generated.type=basic
+      - bootstrap.memory_lock=true
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+      - node.roles=master,data,ingest
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - esdata02:/usr/share/elasticsearch/data
+    networks:
+      - elk-cluster
+
+  es03:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    container_name: es03
+    environment:
+      - node.name=es03
+      - cluster.name=elk-3node-cluster
+      - cluster.initial_master_nodes=es01,es02,es03
+      - discovery.seed_hosts=es01,es02
+      - ELASTIC_PASSWORD=changeme
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=false
+      - xpack.security.transport.ssl.enabled=false
+      - xpack.license.self_generated.type=basic
+      - bootstrap.memory_lock=true
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+      - node.roles=master,data,ingest
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - esdata03:/usr/share/elasticsearch/data
+    networks:
+      - elk-cluster
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.13.0
+    container_name: logstash
+    environment:
+      - ELASTIC_PASSWORD=changeme
+      - xpack.monitoring.elasticsearch.hosts=http://es01:9200
+      - xpack.monitoring.elasticsearch.username=logstash_system
+      - xpack.monitoring.elasticsearch.password=${ES_PASSWORD}
+      - "LS_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+    ports:
+      - "5044:5044"
+      - "5140:5140/udp"
+      - "5140:5140/tcp"
+      - "9600:9600"
+    networks:
+      - elk-cluster
+    depends_on:
+      es01:
+        condition: service_healthy
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.0
+    container_name: kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=["http://es01:9200","http://es02:9200","http://es03:9200"]
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=changeme
+      - xpack.security.enabled=true
+      - SERVER_NAME=kibana
+    ports:
+      - "5601:5601"
+    networks:
+      - elk-cluster
+    depends_on:
+      es01:
+        condition: service_healthy
+
+volumes:
+  esdata01:
+    driver: local
+  esdata02:
+    driver: local
+  esdata03:
+    driver: local
+
+networks:
+  elk-cluster:
+    driver: bridge

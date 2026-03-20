@@ -1,0 +1,219 @@
+# Vector L-MAX: Advanced VRL (Vector Remap Language) transforms for log enrichment
+# Covers: parsing, field extraction, GeoIP, redaction, conditional logic, error handling
+# Docs: https://vector.dev/docs/reference/vrl/
+
+[api]
+enabled = true
+address = "0.0.0.0:8686"
+
+# --- SOURCES ---
+
+[sources.docker_logs]
+type = "docker_logs"
+include_containers = []
+exclude_containers = ["vector"]
+
+[sources.file_logs]
+type = "file"
+include = ["/var/log/app/*.log"]
+read_from = "end"
+
+# --- TRANSFORMS ---
+
+# Stage 1: Parse raw log lines into structured events
+[transforms.parse_raw]
+type = "remap"
+inputs = ["docker_logs", "file_logs"]
+source = '''
+  # Try JSON first
+  parsed, err = parse_json(.message)
+  if err == null && is_object(parsed) {
+    . = merge(., parsed)
+    del(.message)
+  } else {
+    # Try logfmt (key=value pairs)
+    parsed, err = parse_logfmt(.message)
+    if err == null {
+      . = merge(., parsed)
+      del(.message)
+    } else {
+      # Try common log format (Apache/Nginx CLF)
+      parsed, err = parse_common_log(.message)
+      if err == null {
+        . = merge(., parsed)
+        del(.message)
+      }
+      # else keep .message as-is
+    }
+  }
+'''
+
+# Stage 2: Normalize timestamp to RFC3339
+[transforms.normalize_timestamp]
+type = "remap"
+inputs = ["parse_raw"]
+source = '''
+  # Try multiple timestamp field names and formats
+  ts = null
+
+  for_each(["timestamp", "time", "ts", "@timestamp", "date"]) -> |_i, field| {
+    if ts == null && exists(. [field]) {
+      raw = to_string(. [field]) ?? ""
+      # ISO8601 / RFC3339
+      t, err = parse_timestamp(raw, "%+")
+      if err == null { ts = t }
+
+      # Unix epoch (seconds)
+      if ts == null {
+        epoch, err = to_int(raw)
+        if err == null && epoch > 1000000000 {
+          ts = from_unix_timestamp(epoch, "seconds")
+        }
+      }
+
+      # Unix epoch (milliseconds)
+      if ts == null {
+        epoch, err = to_int(raw)
+        if err == null && epoch > 1000000000000 {
+          ts = from_unix_timestamp(epoch, "milliseconds")
+        }
+      }
+    }
+  }
+
+  if ts != null {
+    .@timestamp = ts
+  } else {
+    .@timestamp = now()
+    .timestamp_missing = true
+  }
+'''
+
+# Stage 3: Normalize and validate log level
+[transforms.normalize_level]
+type = "remap"
+inputs = ["normalize_timestamp"]
+source = '''
+  level = null
+  for_each(["level", "log_level", "severity", "lvl", "LEVEL"]) -> |_i, field| {
+    if level == null && exists(. [field]) {
+      level = downcase(to_string(. [field]) ?? "")
+    }
+  }
+
+  # Alias mapping
+  level = if level == "err"      { "error" }
+     else if level == "warning"  { "warn" }
+     else if level == "critical" { "fatal" }
+     else if level == "trace"    { "debug" }
+     else if level == null       { "info" }
+     else { level }
+
+  .log_level = level
+
+  # Set numeric severity for sorting/alerting
+  .log_level_num = if level == "fatal" { 60 }
+    else if level == "error" { 50 }
+    else if level == "warn"  { 40 }
+    else if level == "info"  { 30 }
+    else if level == "debug" { 20 }
+    else { 0 }
+'''
+
+# Stage 4: Extract HTTP request fields if present
+[transforms.extract_http_fields]
+type = "remap"
+inputs = ["normalize_level"]
+source = '''
+  # Parse HTTP status code and method from message or structured fields
+  if exists(.http_method) || exists(.method) {
+    .http.method = upcase(string!(get(., ["http_method"]) ?? get(., ["method"]) ?? ""))
+    .http.status_code = to_int(get(., ["status"]) ?? get(., ["http_status"]) ?? get(., ["status_code"]) ?? 0) ?? 0
+    .http.path = string!(get(., ["path"]) ?? get(., ["url"]) ?? get(., ["uri"]) ?? "")
+    .http.duration_ms = to_float(get(., ["duration_ms"]) ?? get(., ["latency_ms"]) ?? get(., ["response_time"]) ?? 0) ?? 0.0
+
+    # Classify response
+    .http.is_error = .http.status_code >= 400
+    .http.is_server_error = .http.status_code >= 500
+    .http.is_slow = .http.duration_ms > 1000.0
+  }
+'''
+
+# Stage 5: Redact sensitive fields (PII)
+[transforms.redact_pii]
+type = "remap"
+inputs = ["extract_http_fields"]
+source = '''
+  # Redact credit card numbers
+  if exists(.message) {
+    .message = replace(.message, r'\b(?:\d[ -]*?){13,16}\b', "[REDACTED-CC]")
+  }
+
+  # Redact email addresses
+  if exists(.message) {
+    .message = replace(.message, r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', "[REDACTED-EMAIL]")
+  }
+
+  # Remove sensitive keys entirely
+  for_each(["password", "passwd", "secret", "token", "api_key", "authorization", "ssn"]) -> |_i, key| {
+    if exists(. [key]) { . [key] = "[REDACTED]" }
+  }
+'''
+
+# Stage 6: Enrich with environment and pipeline metadata
+[transforms.enrich_metadata]
+type = "remap"
+inputs = ["redact_pii"]
+source = '''
+  .host = get_hostname!()
+  .environment = get_env_var("ENVIRONMENT") ?? "production"
+  .datacenter  = get_env_var("DATACENTER")  ?? "dc1"
+  .pipeline    = "vector-vrl-enrich"
+  .schema_version = "1.0"
+
+  # Compute event fingerprint for deduplication
+  .fingerprint = sha2(
+    join!([
+      to_string(.host) ?? "",
+      to_string(.log_level) ?? "",
+      to_string(.message ?? "") ?? ""
+    ], separator: "|")
+  )
+'''
+
+# --- SINKS ---
+
+[sinks.elasticsearch]
+type = "elasticsearch"
+inputs = ["enrich_metadata"]
+endpoints = ["http://elasticsearch:9200"]
+auth.strategy = "basic"
+auth.user = "${ES_USER:-elastic}"
+auth.password = "${ES_PASSWORD:-changeme}"
+mode = "data_stream"
+data_stream.type = "logs"
+data_stream.dataset = "vrl-enriched"
+data_stream.namespace = "${ENVIRONMENT:-production}"
+
+[sinks.elasticsearch.encoding]
+except_fields = ["fingerprint"]
+
+[sinks.elasticsearch.buffer]
+type = "disk"
+max_size = 268435456
+when_full = "block"
+
+# Dead-letter queue for failed events
+[sinks.failed_events]
+type = "file"
+inputs = []   # populated automatically by Vector for sink errors
+path = "/var/log/vector/failed-%Y-%m-%d.ndjson"
+encoding.codec = "ndjson"
+
+[sources.internal_metrics]
+type = "internal_metrics"
+
+[sinks.prometheus]
+type = "prometheus_exporter"
+inputs = ["internal_metrics"]
+address = "0.0.0.0:9598"
