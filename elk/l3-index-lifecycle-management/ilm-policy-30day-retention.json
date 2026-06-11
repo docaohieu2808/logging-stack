@@ -31,11 +31,11 @@
       },
       "cold": {
         "min_age": "14d",
+        "_note": "freeze action removed: no-op in ES 8.x (deprecated since 7.x). Use searchable_snapshot for cold-tier cost savings in 8.x.",
         "actions": {
           "set_priority": {
             "priority": 0
-          },
-          "freeze": {}
+          }
         }
       },
       "delete": {
