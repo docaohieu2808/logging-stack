@@ -201,7 +201,7 @@ jobs:
       - name: Smoke test (green 3-node cluster, TLS enforced, Logstash line searchable)
         run: |
           docker cp es01:/usr/share/elasticsearch/config/certs/ca/ca.crt "$RUNNER_TEMP/ca.crt"
-          ES_URL=https://localhost:9200 ES_CACERT="$RUNNER_TEMP/ca.crt" scripts/smoke-test.sh cluster
+          ES_URL=https://localhost:9200 ES_CACERT="$RUNNER_TEMP/ca.crt" bash -x scripts/smoke-test.sh cluster
       - name: Logs on failure
         if: failure()
         run: docker compose --env-file .env -f elk/l4-elasticsearch-cluster/docker-compose-elk-3node-cluster.yml logs --no-color --tail 200

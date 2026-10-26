@@ -62,6 +62,7 @@ services:
         chown -R 1000:0 .
         find . -type d -exec chmod 750 {} +
         find . -type f -exec chmod 640 {} +
+        chmod 644 ca/ca.crt   # public CA certificate, readable for clients that copy it out
         echo "certificates ready"
     volumes:
       - certs:/usr/share/elasticsearch/config/certs
