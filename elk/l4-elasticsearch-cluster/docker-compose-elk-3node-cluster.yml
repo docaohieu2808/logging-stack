@@ -121,7 +121,7 @@ services:
       - esdata03:/usr/share/elasticsearch/data
     healthcheck: *es-health
 
-  # One-shot: wait until all three nodes joined (green), then set kibana_system's password.
+  # One-shot: wait until all three nodes joined, then set kibana_system's password.
   setup:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.19.23
     container_name: elk-cluster-setup
@@ -136,7 +136,7 @@ services:
       - |
         set -euo pipefail
         curl -sf --cacert config/certs/ca/ca.crt -u "elastic:$$ELASTIC_PASSWORD" \
-          "https://es01:9200/_cluster/health?wait_for_status=green&wait_for_nodes=3&timeout=120s" >/dev/null
+          "https://es01:9200/_cluster/health?wait_for_status=yellow&wait_for_nodes=3&timeout=120s" >/dev/null
         curl -sf --cacert config/certs/ca/ca.crt -X POST -u "elastic:$$ELASTIC_PASSWORD" \
           -H 'Content-Type: application/json' \
           https://es01:9200/_security/user/kibana_system/_password \

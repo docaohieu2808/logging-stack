@@ -4,7 +4,10 @@
 FROM fluent/fluentd:v1.20.1-debian-1.0
 
 USER root
-RUN gem install --no-document \
+# elasticsearch-ruby 9 sends Elasticsearch-9 compatibility headers that an 8.x server rejects (HTTP 400),
+# so the client gem is pinned to the 8.x line before the plugin pulls in "any" version.
+RUN gem install --no-document elasticsearch:8.19.3 \
+ && gem install --no-document \
       fluent-plugin-elasticsearch:6.0.0 \
       fluent-plugin-s3:1.8.6 \
       fluent-plugin-rewrite-tag-filter:2.4.1 \

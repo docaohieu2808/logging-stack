@@ -87,7 +87,7 @@ smoke_cluster() {
   local nodes tok="smoke-cluster-${run_id}"
   nodes="$(es_curl "${es}/_cat/nodes?h=name" | grep -c '^es0')"
   [ "$nodes" -eq 3 ] || { echo "FAIL  expected 3 nodes, got ${nodes}" >&2; return 1; }
-  es_curl "${es}/_cluster/health" | jq -e '.status == "green" and .number_of_nodes == 3' >/dev/null
+  es_curl "${es}/_cluster/health?wait_for_status=green&timeout=90s" | jq -e '.status == "green" and .number_of_nodes == 3' >/dev/null
   echo "PASS  3-node cluster is green"
 
   # plain HTTP must be refused: TLS is really on
