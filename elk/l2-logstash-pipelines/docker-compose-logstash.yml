@@ -10,7 +10,7 @@ include:
 
 services:
   logstash:
-    image: docker.elastic.co/logstash/logstash:8.19.23
+    image: docker.elastic.co/logstash/logstash:9.5.5
     container_name: logstash
     environment:
       ES_HOST: elasticsearch
