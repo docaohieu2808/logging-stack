@@ -1,145 +1,210 @@
-version: "3.8"
+# ELK L4: 3-node Elasticsearch cluster with TLS (HTTP + transport) + Logstash + Kibana.
+# Run (from the repo root):
+#   cp .env.example .env
+#   docker compose --env-file .env -f elk/l4-elasticsearch-cluster/docker-compose-elk-3node-cluster.yml up -d --wait
+# Kibana: http://localhost:5601   ES: https://localhost:9200 (curl --cacert needs the CA, see README)
+#
+# `certs` (one-shot) creates a CA and one certificate per node into the `certs` volume,
+# `setup` (one-shot) sets the kibana_system password once the cluster is up.
+# RAM: ~3 GB (3 x 512 MB heap + Kibana + Logstash).
+
+x-es-node: &es-node
+  image: docker.elastic.co/elasticsearch/elasticsearch:8.19.23
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 65536
+  networks:
+    - elk-cluster
+  depends_on:
+    certs:
+      condition: service_completed_successfully
+
+x-es-env: &es-env
+  cluster.name: elk-3node-cluster
+  cluster.initial_master_nodes: es01,es02,es03
+  discovery.seed_hosts: es01,es02,es03
+  ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:?copy .env.example to .env}
+  xpack.security.enabled: "true"
+  xpack.license.self_generated.type: basic
+  xpack.security.http.ssl.enabled: "true"
+  xpack.security.http.ssl.certificate_authorities: certs/ca/ca.crt
+  xpack.security.transport.ssl.enabled: "true"
+  xpack.security.transport.ssl.certificate_authorities: certs/ca/ca.crt
+  xpack.security.transport.ssl.verification_mode: certificate
+  ES_JAVA_OPTS: "-Xms512m -Xmx512m"
 
 services:
+  certs:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.19.23
+    container_name: elk-certs
+    user: "0"
+    restart: "no"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        cd /usr/share/elasticsearch/config/certs
+        if [ ! -f ca/ca.crt ]; then
+          /usr/share/elasticsearch/bin/elasticsearch-certutil ca --silent --pem -out ca.zip
+          unzip -q ca.zip
+        fi
+        if [ ! -f es01/es01.crt ]; then
+          printf '%s\n' 'instances:' \
+            '  - name: es01' '    dns: [es01, localhost]' '    ip: [127.0.0.1]' \
+            '  - name: es02' '    dns: [es02, localhost]' '    ip: [127.0.0.1]' \
+            '  - name: es03' '    dns: [es03, localhost]' '    ip: [127.0.0.1]' > instances.yml
+          /usr/share/elasticsearch/bin/elasticsearch-certutil cert --silent --pem \
+            --in instances.yml --ca-cert ca/ca.crt --ca-key ca/ca.key -out certs.zip
+          unzip -q certs.zip
+        fi
+        chown -R 1000:0 .
+        find . -type d -exec chmod 750 {} +
+        find . -type f -exec chmod 640 {} +
+        echo "certificates ready"
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+    networks:
+      - elk-cluster
+
   es01:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    <<: *es-node
     container_name: es01
     environment:
-      - node.name=es01
-      - cluster.name=elk-3node-cluster
-      - cluster.initial_master_nodes=es01,es02,es03
-      - discovery.seed_hosts=es02,es03
-      - ELASTIC_PASSWORD=changeme
-      - xpack.security.enabled=true
-      - xpack.security.http.ssl.enabled=false
-      - xpack.security.transport.ssl.enabled=false
-      - xpack.license.self_generated.type=basic
-      - bootstrap.memory_lock=true
-      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
-      - node.roles=master,data,ingest
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
-      nofile:
-        soft: 65536
-        hard: 65536
+      <<: *es-env
+      node.name: es01
+      xpack.security.http.ssl.key: certs/es01/es01.key
+      xpack.security.http.ssl.certificate: certs/es01/es01.crt
+      xpack.security.transport.ssl.key: certs/es01/es01.key
+      xpack.security.transport.ssl.certificate: certs/es01/es01.crt
     volumes:
+      - certs:/usr/share/elasticsearch/config/certs:ro
       - esdata01:/usr/share/elasticsearch/data
     ports:
       - "9200:9200"
-    networks:
-      - elk-cluster
-    healthcheck:
-      test: ["CMD-SHELL", "curl -s -u elastic:changeme http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
-      interval: 30s
+    healthcheck: &es-health
+      test: ["CMD-SHELL", "curl -sf --cacert config/certs/ca/ca.crt -u elastic:$$ELASTIC_PASSWORD \"https://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s\" >/dev/null"]
+      interval: 10s
       timeout: 10s
-      retries: 5
+      retries: 30
+      start_period: 30s
 
   es02:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    <<: *es-node
     container_name: es02
     environment:
-      - node.name=es02
-      - cluster.name=elk-3node-cluster
-      - cluster.initial_master_nodes=es01,es02,es03
-      - discovery.seed_hosts=es01,es03
-      - ELASTIC_PASSWORD=changeme
-      - xpack.security.enabled=true
-      - xpack.security.http.ssl.enabled=false
-      - xpack.security.transport.ssl.enabled=false
-      - xpack.license.self_generated.type=basic
-      - bootstrap.memory_lock=true
-      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
-      - node.roles=master,data,ingest
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
-      nofile:
-        soft: 65536
-        hard: 65536
+      <<: *es-env
+      node.name: es02
+      xpack.security.http.ssl.key: certs/es02/es02.key
+      xpack.security.http.ssl.certificate: certs/es02/es02.crt
+      xpack.security.transport.ssl.key: certs/es02/es02.key
+      xpack.security.transport.ssl.certificate: certs/es02/es02.crt
     volumes:
+      - certs:/usr/share/elasticsearch/config/certs:ro
       - esdata02:/usr/share/elasticsearch/data
-    networks:
-      - elk-cluster
+    healthcheck: *es-health
 
   es03:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    <<: *es-node
     container_name: es03
     environment:
-      - node.name=es03
-      - cluster.name=elk-3node-cluster
-      - cluster.initial_master_nodes=es01,es02,es03
-      - discovery.seed_hosts=es01,es02
-      - ELASTIC_PASSWORD=changeme
-      - xpack.security.enabled=true
-      - xpack.security.http.ssl.enabled=false
-      - xpack.security.transport.ssl.enabled=false
-      - xpack.license.self_generated.type=basic
-      - bootstrap.memory_lock=true
-      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
-      - node.roles=master,data,ingest
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
-      nofile:
-        soft: 65536
-        hard: 65536
+      <<: *es-env
+      node.name: es03
+      xpack.security.http.ssl.key: certs/es03/es03.key
+      xpack.security.http.ssl.certificate: certs/es03/es03.crt
+      xpack.security.transport.ssl.key: certs/es03/es03.key
+      xpack.security.transport.ssl.certificate: certs/es03/es03.crt
     volumes:
+      - certs:/usr/share/elasticsearch/config/certs:ro
       - esdata03:/usr/share/elasticsearch/data
+    healthcheck: *es-health
+
+  # One-shot: wait until all three nodes joined (green), then set kibana_system's password.
+  setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.19.23
+    container_name: elk-cluster-setup
+    restart: "no"
+    environment:
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:?copy .env.example to .env}
+      KIBANA_PASSWORD: ${KIBANA_PASSWORD:?copy .env.example to .env}
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs:ro
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        curl -sf --cacert config/certs/ca/ca.crt -u "elastic:$$ELASTIC_PASSWORD" \
+          "https://es01:9200/_cluster/health?wait_for_status=green&wait_for_nodes=3&timeout=120s" >/dev/null
+        curl -sf --cacert config/certs/ca/ca.crt -X POST -u "elastic:$$ELASTIC_PASSWORD" \
+          -H 'Content-Type: application/json' \
+          https://es01:9200/_security/user/kibana_system/_password \
+          -d "{\"password\":\"$$KIBANA_PASSWORD\"}"
+        echo "kibana_system password set"
     networks:
       - elk-cluster
+    depends_on:
+      es01:
+        condition: service_healthy
+      es02:
+        condition: service_healthy
+      es03:
+        condition: service_healthy
 
   logstash:
-    image: docker.elastic.co/logstash/logstash:8.13.0
+    image: docker.elastic.co/logstash/logstash:8.19.23
     container_name: logstash
     environment:
-      - ELASTIC_PASSWORD=changeme
-      - xpack.monitoring.elasticsearch.hosts=http://es01:9200
-      - xpack.monitoring.elasticsearch.username=logstash_system
-      - xpack.monitoring.elasticsearch.password=${ES_PASSWORD}
-      - "LS_JAVA_OPTS=-Xms512m -Xmx512m"
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:?copy .env.example to .env}
+      LS_JAVA_OPTS: "-Xms256m -Xmx256m"
+      XPACK_MONITORING_ENABLED: "false"
     volumes:
-      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
-      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - ./logstash-pipeline-cluster.conf:/usr/share/logstash/pipeline/cluster.conf:ro
+      - certs:/usr/share/logstash/certs:ro
     ports:
-      - "5044:5044"
-      - "5140:5140/udp"
       - "5140:5140/tcp"
       - "9600:9600"
     networks:
       - elk-cluster
     depends_on:
-      es01:
-        condition: service_healthy
+      setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9600/_node/pipelines | grep -q \"main\""]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 40s
 
   kibana:
-    image: docker.elastic.co/kibana/kibana:8.13.0
+    image: docker.elastic.co/kibana/kibana:8.19.23
     container_name: kibana
     environment:
-      - ELASTICSEARCH_HOSTS=["http://es01:9200","http://es02:9200","http://es03:9200"]
-      - ELASTICSEARCH_USERNAME=kibana_system
-      - ELASTICSEARCH_PASSWORD=changeme
-      - xpack.security.enabled=true
-      - SERVER_NAME=kibana
+      ELASTICSEARCH_HOSTS: '["https://es01:9200","https://es02:9200","https://es03:9200"]'
+      ELASTICSEARCH_USERNAME: kibana_system
+      ELASTICSEARCH_PASSWORD: ${KIBANA_PASSWORD:?copy .env.example to .env}
+      ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES: /usr/share/kibana/config/certs/ca/ca.crt
+      NODE_OPTIONS: "--max-old-space-size=768"
+    volumes:
+      - certs:/usr/share/kibana/config/certs:ro
     ports:
       - "5601:5601"
     networks:
       - elk-cluster
     depends_on:
-      es01:
-        condition: service_healthy
+      setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5601/api/status | grep -q '\"level\":\"available\"'"]
+      interval: 10s
+      timeout: 10s
+      retries: 40
+      start_period: 40s
 
 volumes:
+  certs:
   esdata01:
-    driver: local
   esdata02:
-    driver: local
   esdata03:
-    driver: local
 
 networks:
   elk-cluster:
-    driver: bridge

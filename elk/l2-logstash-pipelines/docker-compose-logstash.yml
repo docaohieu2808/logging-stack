@@ -1,0 +1,43 @@
+# ELK L2: Logstash with the two pipelines in this directory, on top of the L1 stack.
+# Run (from the repo root):
+#   docker compose --env-file .env -f elk/l2-logstash-pipelines/docker-compose-logstash.yml up -d --wait
+#   (then apply the ILM policy and templates: elk/l3-index-lifecycle-management/apply-ilm.sh)
+# Send a syslog line:   printf 'Oct 26 10:00:00 myhost app[1]: hello\n' | nc -w1 localhost 5140
+# Docker-json input:    append Docker json-file lines to sample-logs/docker-json/*.log
+
+include:
+  - ../l1-basic-elasticsearch-kibana/docker-compose-elk-basic.yml
+
+services:
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.19.23
+    container_name: logstash
+    environment:
+      ES_HOST: elasticsearch
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:?copy .env.example to .env}
+      LS_JAVA_OPTS: "-Xms256m -Xmx256m"
+      XPACK_MONITORING_ENABLED: "false"
+    volumes:
+      - ./logstash-pipeline-syslog.conf:/usr/share/logstash/pipeline/syslog.conf:ro
+      - ./logstash-pipeline-docker-json.conf:/usr/share/logstash/pipeline/docker-json.conf:ro
+      - ../../sample-logs/docker-json:/var/log/docker-json:ro
+      - logstash_data:/usr/share/logstash/data
+    ports:
+      - "5044:5044"       # Beats input
+      - "5140:5140/tcp"   # syslog TCP
+      - "5140:5140/udp"   # syslog UDP
+      - "9600:9600"       # monitoring API
+    networks:
+      - elk
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9600/_node/pipelines | grep -q \"main\""]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 40s
+
+volumes:
+  logstash_data:

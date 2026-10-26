@@ -1,214 +1,117 @@
-version: "3.8"
+# Full logging stack: Elasticsearch + Kibana + Logstash (via the ELK l1/l2 compose files)
+# plus Fluent Bit -> Fluentd aggregator and a Vector aggregator, all writing to ONE
+# single-node Elasticsearch (heap 512 MB, ~4 GB RAM total).
+#
+#   cp .env.example .env
+#   docker compose --env-file .env -f docker-compose-full-logging.yml up -d --wait
+#   ./scripts/smoke-test.sh          # sends one line through every shipper and finds it in ES
+#
+# Optional Prometheus + Grafana for pipeline metrics:  add  --profile metrics
+#
+# Data paths:
+#   Logstash   syslog TCP/UDP :5140, Beats :5044, sample-logs/docker-json/*.log -> logs-syslog-default, logs-docker-default
+#   Fluent Bit tails Docker json-file logs -> Fluentd :24224 (shared key) -> fluentd-* / fluentd-errors-* indices
+#   Vector     HTTP :8080/ingest, Vector :9000, syslog UDP :5140 (inside the network) -> logs-aggregated-<env> data stream
 
-# Full logging stack: Elasticsearch + Logstash + Kibana + Fluentd + Fluent Bit + Vector
-# Usage: docker compose -f docker-compose-full-logging.yml up -d
-# Requires: .env file with ES_PASSWORD, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET
-
-x-es-common: &es-common
-  image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
-  ulimits:
-    memlock:
-      soft: -1
-      hard: -1
-    nofile:
-      soft: 65536
-      hard: 65536
-  environment: &es-env
-    ELASTIC_PASSWORD: ${ES_PASSWORD:-changeme}
-    xpack.security.enabled: "true"
-    xpack.security.http.ssl.enabled: "false"
-    xpack.security.transport.ssl.enabled: "false"
-    xpack.license.self_generated.type: basic
-    bootstrap.memory_lock: "true"
-    cluster.name: full-logging-cluster
-    cluster.initial_master_nodes: es01,es02,es03
-    discovery.seed_hosts: es02,es03
-    ES_JAVA_OPTS: "-Xms512m -Xmx512m"
-  networks:
-    - logging
+include:
+  - elk/l2-logstash-pipelines/docker-compose-logstash.yml
 
 services:
-
-  # ── Elasticsearch nodes ────────────────────────────────────────────────────
-
-  es01:
-    <<: *es-common
-    container_name: es01
-    environment:
-      <<: *es-env
-      node.name: es01
-      discovery.seed_hosts: es02,es03
-      node.roles: master,data,ingest
-    volumes:
-      - esdata01:/usr/share/elasticsearch/data
-    ports:
-      - "9200:9200"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf -u elastic:${ES_PASSWORD:-changeme} http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
-      interval: 30s
-      timeout: 10s
-      retries: 10
-
-  es02:
-    <<: *es-common
-    container_name: es02
-    environment:
-      <<: *es-env
-      node.name: es02
-      discovery.seed_hosts: es01,es03
-      node.roles: master,data,ingest
-    volumes:
-      - esdata02:/usr/share/elasticsearch/data
-
-  es03:
-    <<: *es-common
-    container_name: es03
-    environment:
-      <<: *es-env
-      node.name: es03
-      discovery.seed_hosts: es01,es02
-      node.roles: master,data,ingest
-    volumes:
-      - esdata03:/usr/share/elasticsearch/data
-
-  # ── Logstash ───────────────────────────────────────────────────────────────
-
-  logstash:
-    image: docker.elastic.co/logstash/logstash:8.13.0
-    container_name: logstash
-    environment:
-      ELASTIC_PASSWORD: ${ES_PASSWORD:-changeme}
-      LS_JAVA_OPTS: "-Xms256m -Xmx256m"
-      MONITORING_ENABLED: "false"
-    volumes:
-      - ./elk/l2-logstash-pipelines/logstash-pipeline-syslog.conf:/usr/share/logstash/pipeline/syslog.conf:ro
-      - ./elk/l2-logstash-pipelines/logstash-pipeline-docker-json.conf:/usr/share/logstash/pipeline/docker-json.conf:ro
-      - logstash_data:/usr/share/logstash/data
-    ports:
-      - "5044:5044"       # Beats input
-      - "5140:5140/tcp"   # Syslog TCP
-      - "5140:5140/udp"   # Syslog UDP
-      - "9600:9600"       # Monitoring API
-    networks:
-      - logging
-    depends_on:
-      es01:
-        condition: service_healthy
-
-  # ── Kibana ─────────────────────────────────────────────────────────────────
-
-  kibana:
-    image: docker.elastic.co/kibana/kibana:8.13.0
-    container_name: kibana
-    environment:
-      ELASTICSEARCH_HOSTS: '["http://es01:9200","http://es02:9200","http://es03:9200"]'
-      ELASTICSEARCH_USERNAME: kibana_system
-      ELASTICSEARCH_PASSWORD: ${ES_PASSWORD:-changeme}
-      SERVER_NAME: kibana
-      xpack.security.enabled: "true"
-    ports:
-      - "5601:5601"
-    networks:
-      - logging
-    depends_on:
-      es01:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:5601/api/status | grep -q '\"overall\":{\"level\":\"available\"'"]
-      interval: 30s
-      timeout: 10s
-      retries: 10
-
-  # ── Fluentd aggregator ─────────────────────────────────────────────────────
-
+  # ── Fluentd aggregator (receives from Fluent Bit) ──────────────────────────
   fluentd:
-    image: fluent/fluentd:v1.16-debian-1
-    container_name: fluentd-aggregator
     build:
       context: ./fluentd
-      dockerfile_inline: |
-        FROM fluent/fluentd:v1.16-debian-1
-        USER root
-        RUN gem install fluent-plugin-elasticsearch fluent-plugin-s3 --no-document
-        USER fluent
+      dockerfile: Dockerfile
+    image: logging-stack/fluentd:1.20.1
+    container_name: fluentd-aggregator
     environment:
-      ES_HOST: es01
+      FLUENT_SHARED_KEY: ${FLUENT_SHARED_KEY:?copy .env.example to .env}
+      ES_HOST: elasticsearch
       ES_PORT: "9200"
       ES_USER: elastic
-      ES_PASSWORD: ${ES_PASSWORD:-changeme}
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:?copy .env.example to .env}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AWS_REGION: ${AWS_REGION:-us-east-1}
       S3_BUCKET: ${S3_BUCKET:-my-logs-archive}
-      ENVIRONMENT: ${ENVIRONMENT:-production}
     volumes:
       - ./fluentd/l2-multi-output/fluent-multi-output-es-s3.conf:/fluentd/etc/fluent.conf:ro
       - fluentd_buffer:/var/log/fluentd/buffer
     ports:
-      - "24224:24224"     # Fluentd forward input
-      - "24224:24224/udp"
+      - "24224:24224"
     networks:
-      - logging
+      - elk
     depends_on:
-      es01:
+      elasticsearch:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/24224'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
 
-  # ── Fluent Bit edge collector ──────────────────────────────────────────────
-
+  # ── Fluent Bit edge collector (Docker json-file logs -> Fluentd) ───────────
   fluent-bit:
-    image: fluent/fluent-bit:3.0
+    image: fluent/fluent-bit:5.1.5
     container_name: fluent-bit
     environment:
       HOSTNAME: fluent-bit-agent
+      FLUENTD_HOST: fluentd-aggregator
+      FLUENT_SHARED_KEY: ${FLUENT_SHARED_KEY:?copy .env.example to .env}
     volumes:
       - ./fluentd/l3-fluent-bit-lightweight/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
       - fluent_bit_db:/var/log/fluentbit
     ports:
-      - "2020:2020"       # Fluent Bit HTTP monitoring
+      - "2020:2020"       # Fluent Bit HTTP monitoring + Prometheus metrics
     networks:
-      - logging
+      - elk
     depends_on:
-      - fluentd
+      fluentd:
+        condition: service_healthy
 
   # ── Vector aggregator ──────────────────────────────────────────────────────
-
   vector:
-    image: timberio/vector:0.38.0-debian
+    image: timberio/vector:0.60.0-alpine
     container_name: vector-aggregator
+    command: ["--config", "/etc/vector/vector.toml"]
     environment:
+      # Vector 0.60+ only expands ${VAR} in config files when this is true.
+      VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION: "true"
+      ES_HOST: elasticsearch
       ES_USER: elastic
-      ES_PASSWORD: ${ES_PASSWORD:-changeme}
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:?copy .env.example to .env}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AWS_REGION: ${AWS_REGION:-us-east-1}
-      S3_BUCKET: ${S3_BUCKET:-my-logs-archive}
-      ENVIRONMENT: ${ENVIRONMENT:-production}
-      DATACENTER: ${DATACENTER:-dc1}
+      S3_BUCKET: ${S3_BUCKET:-logs-archive}
+      ENVIRONMENT: ${ENVIRONMENT:-lab}
     volumes:
       - ./vector/l3-vector-aggregator/vector-aggregator-multi-source.toml:/etc/vector/vector.toml:ro
-      - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - vector_data:/var/log/vector
+      - vector_data:/var/lib/vector
     ports:
       - "9000:9000"       # Vector-to-Vector source
       - "8080:8080"       # HTTP ingest
       - "9598:9598"       # Prometheus metrics
       - "8686:8686"       # Vector API
     networks:
-      - logging
+      - elk
     depends_on:
-      es01:
+      elasticsearch:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8686/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
 
-  # ── Optional: Prometheus + Grafana for log pipeline metrics ───────────────
-
+  # ── Optional: Prometheus + Grafana for pipeline metrics (--profile metrics) ─
   prometheus:
-    image: prom/prometheus:v2.51.0
+    image: prom/prometheus:v3.15.1
     container_name: prometheus
-    volumes:
-      - prometheus_data:/prometheus
+    profiles: [metrics]
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
@@ -216,73 +119,48 @@ services:
     configs:
       - source: prometheus_config
         target: /etc/prometheus/prometheus.yml
+    volumes:
+      - prometheus_data:/prometheus
     ports:
       - "9090:9090"
     networks:
-      - logging
+      - elk
 
   grafana:
-    image: grafana/grafana:10.4.0
+    image: grafana/grafana:13.2.4
     container_name: grafana
+    profiles: [metrics]
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?copy .env.example to .env}
       GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
       - grafana_data:/var/lib/grafana
     ports:
       - "3000:3000"
     networks:
-      - logging
+      - elk
     depends_on:
       - prometheus
 
-# ── Volumes ────────────────────────────────────────────────────────────────
-
 volumes:
-  esdata01:
-  esdata02:
-  esdata03:
-  logstash_data:
   fluentd_buffer:
   fluent_bit_db:
   vector_data:
   prometheus_data:
   grafana_data:
 
-# ── Networks ───────────────────────────────────────────────────────────────
-
-networks:
-  logging:
-    driver: bridge
-
-# ── Configs ────────────────────────────────────────────────────────────────
-
 configs:
+  # Elasticsearch and Logstash do not expose Prometheus-format metrics natively
+  # (that needs elasticsearch_exporter), so only the two shippers that do are scraped.
   prometheus_config:
     content: |
       global:
         scrape_interval: 15s
-        evaluation_interval: 15s
-
       scrape_configs:
         - job_name: vector
           static_configs:
             - targets: ["vector-aggregator:9598"]
-
-        - job_name: elasticsearch
-          static_configs:
-            - targets: ["es01:9200"]
-          metrics_path: /_prometheus/metrics
-          basic_auth:
-            username: elastic
-            password: ${ES_PASSWORD:-changeme}
-
-        - job_name: logstash
-          static_configs:
-            - targets: ["logstash:9600"]
-          metrics_path: /_node/stats
-
         - job_name: fluent-bit
+          metrics_path: /api/v2/metrics/prometheus
           static_configs:
             - targets: ["fluent-bit:2020"]
-          metrics_path: /api/v1/metrics/prometheus

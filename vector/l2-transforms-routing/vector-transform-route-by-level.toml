@@ -4,6 +4,7 @@
 #         info/debug  → elasticsearch general index
 #         all         → S3 archive
 # Docs: https://vector.dev/docs/reference/configuration/transforms/route/
+# NOTE: Vector 0.60+ expands environment variables only when VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true is set.
 
 [api]
 enabled = true
@@ -32,8 +33,8 @@ source = '''
   # Parse JSON messages
   if is_string(.message) {
     parsed, err = parse_json(.message)
-    if err == null {
-      . = merge(., parsed)
+    if err == null && is_object(parsed) {
+      . = merge!(., object!(parsed))
     }
   }
 
@@ -43,7 +44,7 @@ source = '''
   if exists(.severity) { level = downcase(string!(.severity)) }
   if exists(.lvl)      { level = downcase(string!(.lvl)) }
 
-  .log_level = level ?? "info"
+  .log_level = if level == null { "info" } else { level }
 
   # Map aliases to canonical levels
   if .log_level == "err"      { .log_level = "error" }
@@ -87,10 +88,10 @@ source = '''
 [sinks.es_errors]
 type = "elasticsearch"
 inputs = ["enrich_errors"]
-endpoints = ["http://elasticsearch:9200"]
+endpoints = ["http://${ES_HOST:-elasticsearch}:9200"]
 auth.strategy = "basic"
 auth.user = "${ES_USER:-elastic}"
-auth.password = "${ES_PASSWORD:-changeme}"
+auth.password = "${ELASTIC_PASSWORD}"
 bulk.index = "logs-errors-%Y.%m.%d"
 bulk.action = "index"
 
@@ -106,10 +107,10 @@ when_full = "block"
 [sinks.es_warnings]
 type = "elasticsearch"
 inputs = ["route_by_level.warnings"]
-endpoints = ["http://elasticsearch:9200"]
+endpoints = ["http://${ES_HOST:-elasticsearch}:9200"]
 auth.strategy = "basic"
 auth.user = "${ES_USER:-elastic}"
-auth.password = "${ES_PASSWORD:-changeme}"
+auth.password = "${ELASTIC_PASSWORD}"
 bulk.index = "logs-warnings-%Y.%m.%d"
 
 [sinks.es_warnings.encoding]
@@ -119,10 +120,10 @@ except_fields = ["ingest_ts"]
 [sinks.es_general]
 type = "elasticsearch"
 inputs = ["route_by_level.info", "route_by_level.debug", "route_by_level._unmatched"]
-endpoints = ["http://elasticsearch:9200"]
+endpoints = ["http://${ES_HOST:-elasticsearch}:9200"]
 auth.strategy = "basic"
 auth.user = "${ES_USER:-elastic}"
-auth.password = "${ES_PASSWORD:-changeme}"
+auth.password = "${ELASTIC_PASSWORD}"
 bulk.index = "logs-general-%Y.%m.%d"
 
 [sinks.es_general.encoding]
@@ -136,7 +137,8 @@ bucket = "${S3_BUCKET:-my-logs-archive}"
 region = "${AWS_REGION:-us-east-1}"
 key_prefix = "vector-logs/%Y/%m/%d/%H/"
 compression = "gzip"
-encoding.codec = "ndjson"
+encoding.codec = "json"
+framing.method = "newline_delimited"
 
 [sinks.s3_archive.batch]
 max_bytes = 10485760   # 10MB per file

@@ -21,7 +21,6 @@ fingerprint.lines = 1
 [sources.docker_logs]
 type = "docker_logs"
 include_containers = []         # empty = all containers
-include_labels = {}
 exclude_containers = ["vector"] # avoid self-collection
 
 # --- TRANSFORMS ---
@@ -33,8 +32,8 @@ inputs = ["app_logs"]
 source = '''
   # Attempt to parse message as JSON
   parsed, err = parse_json(.message)
-  if err == null {
-    . = merge(., parsed)
+  if err == null && is_object(parsed) {
+    . = merge!(., object!(parsed))
     del(.message)
   }
 

@@ -2,6 +2,7 @@
 # Deploy as a central aggregator that upstream agents forward to via vector sink
 # Handles: deduplication, batching, fan-out to ES + S3 + metrics
 # Docs: https://vector.dev/docs/setup/deployment/roles/aggregator/
+# NOTE: Vector 0.60+ expands environment variables only when VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true is set.
 
 [api]
 enabled = true
@@ -98,10 +99,10 @@ key_field = "host"
 [sinks.elasticsearch]
 type = "elasticsearch"
 inputs = ["throttle"]
-endpoints = ["http://elasticsearch:9200"]
+endpoints = ["http://${ES_HOST:-elasticsearch}:9200"]
 auth.strategy = "basic"
 auth.user = "${ES_USER:-elastic}"
-auth.password = "${ES_PASSWORD:-changeme}"
+auth.password = "${ELASTIC_PASSWORD}"
 mode = "data_stream"
 data_stream.type = "logs"
 data_stream.dataset = "aggregated"
@@ -129,7 +130,8 @@ bucket = "${S3_BUCKET:-logs-archive}"
 region = "${AWS_REGION:-us-east-1}"
 key_prefix = "aggregated/%Y/%m/%d/%H/{{ source_type }}/"
 compression = "gzip"
-encoding.codec = "ndjson"
+encoding.codec = "json"
+framing.method = "newline_delimited"
 
 [sinks.s3_archive.batch]
 max_bytes = 52428800   # 50MB

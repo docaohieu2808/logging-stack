@@ -1,0 +1,12 @@
+{
+  "index_patterns": ["logs-docker-*", "logs-syslog-*"],
+  "data_stream": {},
+  "priority": 300,
+  "composed_of": ["logs@mappings", "logs@settings", "ecs@mappings"],
+  "template": {
+    "settings": {
+      "index.lifecycle.name": "logs-30day-retention",
+      "index.number_of_replicas": 0
+    }
+  }
+}

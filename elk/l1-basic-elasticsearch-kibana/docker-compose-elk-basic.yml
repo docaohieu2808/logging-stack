@@ -1,56 +1,90 @@
-version: "3.8"
+# ELK L1: single-node Elasticsearch + Kibana (security on, plain HTTP, lab only).
+# Run (from the repo root):
+#   cp .env.example .env
+#   docker compose --env-file .env -f elk/l1-basic-elasticsearch-kibana/docker-compose-elk-basic.yml up -d --wait
+# Kibana: http://localhost:5601  (user: elastic, password: ELASTIC_PASSWORD)
+#
+# Why a `setup` container: ELASTIC_PASSWORD only sets the password of the `elastic`
+# user. Kibana connects as `kibana_system`, which has NO password until someone sets
+# it through the security API, otherwise Kibana loops on 401. `setup` does that once.
 
 services:
   elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.19.23
     container_name: elasticsearch
     environment:
-      - node.name=elasticsearch
-      - cluster.name=elk-cluster
-      - discovery.type=single-node
-      - ELASTIC_PASSWORD=changeme
-      - xpack.security.enabled=true
-      - xpack.security.http.ssl.enabled=false
-      - xpack.license.self_generated.type=basic
-      - bootstrap.memory_lock=true
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      node.name: elasticsearch
+      cluster.name: elk-cluster
+      discovery.type: single-node
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:?copy .env.example to .env}
+      xpack.security.enabled: "true"
+      xpack.security.http.ssl.enabled: "false"
+      xpack.license.self_generated.type: basic
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
     ulimits:
-      memlock:
-        soft: -1
-        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
     volumes:
       - esdata:/usr/share/elasticsearch/data
     ports:
       - "9200:9200"
-      - "9300:9300"
     networks:
       - elk
     healthcheck:
-      test: ["CMD-SHELL", "curl -s -u elastic:changeme http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\\|yellow\"'"]
-      interval: 30s
+      test: ["CMD-SHELL", "curl -sf -u elastic:$$ELASTIC_PASSWORD \"http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s\" >/dev/null"]
+      interval: 10s
       timeout: 10s
-      retries: 5
+      retries: 30
+      start_period: 30s
 
-  kibana:
-    image: docker.elastic.co/kibana/kibana:8.13.0
-    container_name: kibana
+  # One-shot: give kibana_system its password, then exit 0.
+  setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.19.23
+    container_name: elk-setup
+    restart: "no"
     environment:
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
-      - ELASTICSEARCH_USERNAME=kibana_system
-      - ELASTICSEARCH_PASSWORD=changeme
-      - xpack.security.enabled=true
-    ports:
-      - "5601:5601"
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:?copy .env.example to .env}
+      KIBANA_PASSWORD: ${KIBANA_PASSWORD:?copy .env.example to .env}
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        curl -sf -X POST -u "elastic:$$ELASTIC_PASSWORD" \
+          -H 'Content-Type: application/json' \
+          http://elasticsearch:9200/_security/user/kibana_system/_password \
+          -d "{\"password\":\"$$KIBANA_PASSWORD\"}"
+        echo "kibana_system password set"
     networks:
       - elk
     depends_on:
       elasticsearch:
         condition: service_healthy
 
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.19.23
+    container_name: kibana
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      ELASTICSEARCH_USERNAME: kibana_system
+      ELASTICSEARCH_PASSWORD: ${KIBANA_PASSWORD:?copy .env.example to .env}
+      NODE_OPTIONS: "--max-old-space-size=768"
+    ports:
+      - "5601:5601"
+    networks:
+      - elk
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5601/api/status | grep -q '\"level\":\"available\"'"]
+      interval: 10s
+      timeout: 10s
+      retries: 40
+      start_period: 40s
+
 volumes:
   esdata:
-    driver: local
 
 networks:
   elk:
-    driver: bridge

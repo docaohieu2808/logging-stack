@@ -1,6 +1,14 @@
 # Vector L-MAX: Advanced VRL (Vector Remap Language) transforms for log enrichment
-# Covers: parsing, field extraction, GeoIP, redaction, conditional logic, error handling
+# Covers: parsing with fallbacks, timestamp/level normalisation, HTTP field extraction,
+#         PII redaction, metadata enrichment, error handling (fallible functions)
 # Docs: https://vector.dev/docs/reference/vrl/
+# NOTE: Vector 0.60+ expands environment variables only when VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true is set.
+# Validate: vector validate --no-environment vector-vrl-transform-enrich.toml
+#
+# VRL rules this file demonstrates (the compiler enforces them):
+#   - fallible functions must be handled: `fn!()` (abort), `val, err = fn()`, or `fn() ?? default`
+#   - `??` is only allowed on fallible expressions
+#   - there is no mutation of outer variables inside closures, so loops return a value instead
 
 [api]
 enabled = true
@@ -20,165 +28,190 @@ read_from = "end"
 
 # --- TRANSFORMS ---
 
-# Stage 1: Parse raw log lines into structured events
+# Stage 1: Parse raw log lines into structured events (JSON, then logfmt, then CLF)
 [transforms.parse_raw]
 type = "remap"
+drop_on_error = true
+reroute_dropped = true
 inputs = ["docker_logs", "file_logs"]
 source = '''
-  # Try JSON first
-  parsed, err = parse_json(.message)
+  msg = string(.message) ?? ""
+
+  parsed, err = parse_json(msg)
   if err == null && is_object(parsed) {
-    . = merge(., parsed)
+    . = merge(., object!(parsed))
     del(.message)
   } else {
-    # Try logfmt (key=value pairs)
-    parsed, err = parse_logfmt(.message)
-    if err == null {
+    parsed, err = parse_logfmt(msg)
+    # plain text also "parses" as logfmt (every word becomes a key), so require key=value pairs
+    if err == null && contains(msg, "=") {
       . = merge(., parsed)
       del(.message)
     } else {
-      # Try common log format (Apache/Nginx CLF)
-      parsed, err = parse_common_log(.message)
+      parsed, err = parse_common_log(msg)
       if err == null {
         . = merge(., parsed)
-        del(.message)
       }
       # else keep .message as-is
     }
   }
 '''
 
-# Stage 2: Normalize timestamp to RFC3339
+# Stage 2: Normalise the event timestamp (RFC3339 string, epoch seconds or epoch milliseconds)
 [transforms.normalize_timestamp]
 type = "remap"
+drop_on_error = true
+reroute_dropped = true
 inputs = ["parse_raw"]
 source = '''
-  # Try multiple timestamp field names and formats
+  raw = .timestamp
+  if raw == null { raw = .time }
+  if raw == null { raw = .ts }
+  if raw == null { raw = .date }
+
   ts = null
-
-  for_each(["timestamp", "time", "ts", "@timestamp", "date"]) -> |_i, field| {
-    if ts == null && exists(. [field]) {
-      raw = to_string(. [field]) ?? ""
-      # ISO8601 / RFC3339
-      t, err = parse_timestamp(raw, "%+")
-      if err == null { ts = t }
-
-      # Unix epoch (seconds)
-      if ts == null {
-        epoch, err = to_int(raw)
-        if err == null && epoch > 1000000000 {
-          ts = from_unix_timestamp(epoch, "seconds")
-        }
-      }
-
-      # Unix epoch (milliseconds)
-      if ts == null {
-        epoch, err = to_int(raw)
-        if err == null && epoch > 1000000000000 {
-          ts = from_unix_timestamp(epoch, "milliseconds")
-        }
-      }
+  if is_string(raw) {
+    ts, _err = parse_timestamp(string!(raw), "%+")
+  } else if is_integer(raw) {
+    epoch = int!(raw)
+    if epoch > 1000000000000 {
+      ts = from_unix_timestamp!(epoch, unit: "milliseconds")
+    } else if epoch > 1000000000 {
+      ts = from_unix_timestamp!(epoch, unit: "seconds")
     }
   }
 
   if ts != null {
-    .@timestamp = ts
+    .timestamp = ts
   } else {
-    .@timestamp = now()
+    .timestamp = now()
     .timestamp_missing = true
   }
+  del(.time)
+  del(.ts)
+  del(.date)
 '''
 
-# Stage 3: Normalize and validate log level
+# Stage 3: Normalise and validate the log level
 [transforms.normalize_level]
 type = "remap"
+drop_on_error = true
+reroute_dropped = true
 inputs = ["normalize_timestamp"]
 source = '''
-  level = null
-  for_each(["level", "log_level", "severity", "lvl", "LEVEL"]) -> |_i, field| {
-    if level == null && exists(. [field]) {
-      level = downcase(to_string(. [field]) ?? "")
-    }
+  raw = .level
+  if raw == null { raw = .log_level }
+  if raw == null { raw = .severity }
+  if raw == null { raw = .lvl }
+
+  level = if is_string(raw) { downcase(string!(raw)) } else { "info" }
+
+  if level == "err" {
+    level = "error"
+  } else if level == "warning" {
+    level = "warn"
+  } else if level == "critical" {
+    level = "fatal"
+  } else if level == "trace" {
+    level = "debug"
   }
 
-  # Alias mapping
-  level = if level == "err"      { "error" }
-     else if level == "warning"  { "warn" }
-     else if level == "critical" { "fatal" }
-     else if level == "trace"    { "debug" }
-     else if level == null       { "info" }
-     else { level }
-
   .log_level = level
+  del(.level)
+  del(.severity)
+  del(.lvl)
 
-  # Set numeric severity for sorting/alerting
-  .log_level_num = if level == "fatal" { 60 }
-    else if level == "error" { 50 }
-    else if level == "warn"  { 40 }
-    else if level == "info"  { 30 }
-    else if level == "debug" { 20 }
-    else { 0 }
+  # Numeric severity for sorting/alerting
+  .log_level_num = 0
+  if level == "fatal" {
+    .log_level_num = 60
+  } else if level == "error" {
+    .log_level_num = 50
+  } else if level == "warn" {
+    .log_level_num = 40
+  } else if level == "info" {
+    .log_level_num = 30
+  } else if level == "debug" {
+    .log_level_num = 20
+  }
 '''
 
 # Stage 4: Extract HTTP request fields if present
 [transforms.extract_http_fields]
 type = "remap"
+drop_on_error = true
+reroute_dropped = true
 inputs = ["normalize_level"]
 source = '''
-  # Parse HTTP status code and method from message or structured fields
-  if exists(.http_method) || exists(.method) {
-    .http.method = upcase(string!(get(., ["http_method"]) ?? get(., ["method"]) ?? ""))
-    .http.status_code = to_int(get(., ["status"]) ?? get(., ["http_status"]) ?? get(., ["status_code"]) ?? 0) ?? 0
-    .http.path = string!(get(., ["path"]) ?? get(., ["url"]) ?? get(., ["uri"]) ?? "")
-    .http.duration_ms = to_float(get(., ["duration_ms"]) ?? get(., ["latency_ms"]) ?? get(., ["response_time"]) ?? 0) ?? 0.0
+  method = .http_method
+  if method == null { method = .method }
 
-    # Classify response
-    .http.is_error = .http.status_code >= 400
-    .http.is_server_error = .http.status_code >= 500
-    .http.is_slow = .http.duration_ms > 1000.0
+  if method != null {
+    status = .status
+    if status == null { status = .http_status }
+    if status == null { status = .status_code }
+
+    dur_raw = .duration_ms
+    if dur_raw == null { dur_raw = .latency_ms }
+    if dur_raw == null { dur_raw = .response_time }
+
+    status_code = to_int(status) ?? 0
+    duration_ms = to_float(dur_raw) ?? 0.0
+
+    path = .path
+    if path == null { path = .url }
+    if path == null { path = .uri }
+
+    .http.method = upcase(to_string(method) ?? "")
+    .http.status_code = status_code
+    .http.path = to_string(path) ?? ""
+    .http.duration_ms = duration_ms
+    .http.is_error = status_code >= 400
+    .http.is_server_error = status_code >= 500
+    .http.is_slow = duration_ms > 1000.0
   }
 '''
 
-# Stage 5: Redact sensitive fields (PII)
+# Stage 5: Redact sensitive data (PII)
 [transforms.redact_pii]
 type = "remap"
+drop_on_error = true
+reroute_dropped = true
 inputs = ["extract_http_fields"]
 source = '''
-  # Redact credit card numbers
-  if exists(.message) {
-    .message = replace(.message, r'\b(?:\d[ -]*?){13,16}\b', "[REDACTED-CC]")
-  }
-
-  # Redact email addresses
-  if exists(.message) {
+  if is_string(.message) {
+    # credit-card-like digit runs
+    .message = replace(string!(.message), r'\b(?:\d[ -]?){13,16}\b', "[REDACTED-CC]")
+    # e-mail addresses
     .message = replace(.message, r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', "[REDACTED-EMAIL]")
   }
 
-  # Remove sensitive keys entirely
+  # Mask sensitive keys wherever they appear at the top level
   for_each(["password", "passwd", "secret", "token", "api_key", "authorization", "ssn"]) -> |_i, key| {
-    if exists(. [key]) { . [key] = "[REDACTED]" }
+    if get!(., [key]) != null {
+      . = set!(., [key], "[REDACTED]")
+    }
   }
 '''
 
 # Stage 6: Enrich with environment and pipeline metadata
 [transforms.enrich_metadata]
 type = "remap"
+drop_on_error = true
+reroute_dropped = true
 inputs = ["redact_pii"]
 source = '''
-  .host = get_hostname!()
+  host = get_hostname!()
+  .host = host
   .environment = get_env_var("ENVIRONMENT") ?? "production"
   .datacenter  = get_env_var("DATACENTER")  ?? "dc1"
   .pipeline    = "vector-vrl-enrich"
   .schema_version = "1.0"
 
-  # Compute event fingerprint for deduplication
-  .fingerprint = sha2(
-    join!([
-      to_string(.host) ?? "",
-      to_string(.log_level) ?? "",
-      to_string(.message ?? "") ?? ""
-    ], separator: "|")
-  )
+  # Fingerprint for downstream deduplication
+  msg = string(.message) ?? ""
+  level = string(.log_level) ?? ""
+  .fingerprint = sha2(host + "|" + level + "|" + msg)
 '''
 
 # --- SINKS ---
@@ -186,10 +219,10 @@ source = '''
 [sinks.elasticsearch]
 type = "elasticsearch"
 inputs = ["enrich_metadata"]
-endpoints = ["http://elasticsearch:9200"]
+endpoints = ["http://${ES_HOST:-elasticsearch}:9200"]
 auth.strategy = "basic"
 auth.user = "${ES_USER:-elastic}"
-auth.password = "${ES_PASSWORD:-changeme}"
+auth.password = "${ELASTIC_PASSWORD}"
 mode = "data_stream"
 data_stream.type = "logs"
 data_stream.dataset = "vrl-enriched"
@@ -203,12 +236,20 @@ type = "disk"
 max_size = 268435456
 when_full = "block"
 
-# Dead-letter queue for failed events
+# Dead-letter queue: any event on which a VRL stage aborted (a `fn!()` call failed)
+# is rerouted to the `<transform>.dropped` output instead of being lost.
 [sinks.failed_events]
 type = "file"
-inputs = []   # populated automatically by Vector for sink errors
+inputs = [
+  "parse_raw.dropped",
+  "normalize_timestamp.dropped",
+  "normalize_level.dropped",
+  "extract_http_fields.dropped",
+  "redact_pii.dropped",
+  "enrich_metadata.dropped",
+]
 path = "/var/log/vector/failed-%Y-%m-%d.ndjson"
-encoding.codec = "ndjson"
+encoding.codec = "json"
 
 [sources.internal_metrics]
 type = "internal_metrics"

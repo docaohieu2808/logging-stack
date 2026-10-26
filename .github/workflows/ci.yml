@@ -1,0 +1,204 @@
+# Proves every level of the repo on every push and once a week:
+# - lint: actionlint, shellcheck, yamllint, JSON + Ruby syntax, `docker compose config`, action pins are real commits
+# - vector: `vector validate` for every config, `vector test` for the VRL unit tests
+# - fluent: `fluent-bit --dry-run` (l3) and `fluentd --dry-run` (l1, l2, in the image built from fluentd/Dockerfile)
+# - logstash: `logstash --config.test_and_exit` for every pipeline
+# - smoke-elk: ELK l1-l3 up with `docker compose up --wait`, ILM applied, a syslog line and a docker-json line
+#   become searchable in Elasticsearch and live in data streams managed by the ILM policy
+# - smoke-shippers: the full stack; a line through Vector (HTTP) and through Fluent Bit -> Fluentd (normal + error
+#   index) becomes searchable
+# - smoke-cluster: ELK l4, 3 nodes with TLS, green cluster, plain HTTP refused, a Logstash line searchable
+name: ci
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  VECTOR_IMAGE: timberio/vector:0.60.0-alpine
+  FLUENT_BIT_IMAGE: fluent/fluent-bit:5.1.5
+  LOGSTASH_IMAGE: docker.elastic.co/logstash/logstash:8.19.23
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          bash <(curl -sSfL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "$ACTIONLINT_VERSION"
+          ./actionlint -color
+      - name: shellcheck
+        run: shellcheck scripts/*.sh elk/l3-index-lifecycle-management/apply-ilm.sh
+      - name: yamllint
+        run: |
+          pip install --quiet yamllint==1.37.1
+          yamllint -c .yamllint.yml .github docker-compose-full-logging.yml elk .yamllint.yml
+      - name: JSON files parse
+        run: |
+          for f in $(git ls-files '*.json'); do jq empty "$f" && echo "ok $f"; done
+      - name: Ruby skeletons have valid syntax
+        run: |
+          for f in $(git ls-files '*.rb'); do ruby -c "$f"; done
+      - name: docker compose config (all compose files)
+        run: |
+          for f in docker-compose-full-logging.yml elk/l1-basic-elasticsearch-kibana/docker-compose-elk-basic.yml \
+                   elk/l2-logstash-pipelines/docker-compose-logstash.yml elk/l4-elasticsearch-cluster/docker-compose-elk-3node-cluster.yml; do
+            docker compose --env-file .env.example -f "$f" config --quiet
+            echo "ok $f"
+          done
+          docker compose --env-file .env.example -f docker-compose-full-logging.yml --profile metrics config --quiet
+      - name: Every action is pinned to a commit SHA that exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          refs=$(grep -rhE '^[[:space:]]*(- )?uses: *[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@' .github \
+            | sed -E 's/^[[:space:]]*(- )?uses: *//; s/[[:space:]].*$//' | sort -u)
+          status=0
+          while IFS=@ read -r ref sha; do
+            repo=$(echo "$ref" | cut -d/ -f1-2)
+            if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then echo "FAIL $ref@$sha is not pinned to a SHA"; status=1
+            elif gh api "repos/$repo/commits/$sha" --jq .sha >/dev/null 2>&1; then echo "ok   $ref@$sha"
+            else echo "FAIL $ref@$sha is not a commit"; status=1; fi
+          done <<< "$refs"
+          exit "$status"
+
+  vector:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: vector validate (every config)
+        run: |
+          for f in vector/*/*.toml; do
+            case "$f" in *.tests.toml) continue ;; esac
+            echo "== $f"
+            docker run --rm -e VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true -e ELASTIC_PASSWORD=ci \
+              -v "$PWD/vector:/v:ro" "$VECTOR_IMAGE" validate --no-environment "/v/${f#vector/}"
+          done
+      - name: vector test (VRL unit tests)
+        run: |
+          docker run --rm -e VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true -e ELASTIC_PASSWORD=ci \
+            -v "$PWD/vector:/v:ro" "$VECTOR_IMAGE" test \
+            /v/l-max-vector-remap-vrl/vector-vrl-transform-enrich.toml /v/l-max-vector-remap-vrl/vector-vrl-transform-enrich.tests.toml
+
+  fluent:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: fluent-bit --dry-run (l3)
+        run: |
+          docker run --rm -e HOSTNAME=ci -e FLUENTD_HOST=fluentd-aggregator -e FLUENT_SHARED_KEY=ci \
+            -v "$PWD/fluentd/l3-fluent-bit-lightweight/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro" \
+            "$FLUENT_BIT_IMAGE" /fluent-bit/bin/fluent-bit -c /fluent-bit/etc/fluent-bit.conf --dry-run
+      - name: Build the Fluentd image
+        run: docker build -t logging-stack-fluentd:ci fluentd
+      - name: fluentd --dry-run (l1, l2)
+        run: |
+          docker run --rm -e AGGREGATOR_HOST=127.0.0.1 -e FLUENT_SHARED_KEY=ci \
+            -v "$PWD/fluentd/l1-basic-forward/fluent.conf:/fluentd/etc/test.conf:ro" \
+            logging-stack-fluentd:ci fluentd --dry-run -c /fluentd/etc/test.conf
+          docker run --rm -e FLUENT_SHARED_KEY=ci -e ELASTIC_PASSWORD=ci \
+            -v "$PWD/fluentd/l2-multi-output/fluent-multi-output-es-s3.conf:/fluentd/etc/test.conf:ro" \
+            logging-stack-fluentd:ci fluentd --dry-run -c /fluentd/etc/test.conf
+
+  logstash:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: logstash --config.test_and_exit (every pipeline)
+        run: |
+          for f in elk/l2-logstash-pipelines/logstash-pipeline-syslog.conf \
+                   elk/l2-logstash-pipelines/logstash-pipeline-docker-json.conf \
+                   elk/l4-elasticsearch-cluster/logstash-pipeline-cluster.conf; do
+            echo "== $f"
+            docker run --rm -e ELASTIC_PASSWORD=ci -e XPACK_MONITORING_ENABLED=false \
+              -v "$PWD/$f:/pipelines/test.conf:ro" "$LOGSTASH_IMAGE" \
+              logstash --path.data /tmp/ls-data --config.test_and_exit -f /pipelines/test.conf
+          done
+
+  smoke-elk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Create .env
+        run: cp .env.example .env
+      - name: Start ELK l1 + l2 (Elasticsearch, Kibana, Logstash)
+        run: |
+          docker compose --env-file .env -f elk/l2-logstash-pipelines/docker-compose-logstash.yml up -d --wait --wait-timeout 600
+          docker compose --env-file .env -f elk/l2-logstash-pipelines/docker-compose-logstash.yml ps
+      - name: Smoke test (ILM + Logstash syslog and docker-json inputs)
+        run: scripts/smoke-test.sh elk
+      - name: Logs on failure
+        if: failure()
+        run: docker compose --env-file .env -f elk/l2-logstash-pipelines/docker-compose-logstash.yml logs --no-color --tail 200
+      - name: Tear down
+        if: always()
+        run: docker compose --env-file .env -f elk/l2-logstash-pipelines/docker-compose-logstash.yml down -v
+
+  smoke-shippers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Create .env
+        run: cp .env.example .env
+      - name: Start the full stack (ELK + Fluent Bit + Fluentd + Vector)
+        run: |
+          docker compose --env-file .env -f docker-compose-full-logging.yml up -d --build --wait --wait-timeout 900
+          docker compose --env-file .env -f docker-compose-full-logging.yml ps
+      - name: Smoke test (all shippers)
+        run: scripts/smoke-test.sh all
+      - name: Logs on failure
+        if: failure()
+        run: docker compose --env-file .env -f docker-compose-full-logging.yml logs --no-color --tail 200
+      - name: Tear down
+        if: always()
+        run: docker compose --env-file .env -f docker-compose-full-logging.yml down -v
+
+  smoke-cluster:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Create .env
+        run: cp .env.example .env
+      - name: Start the 3-node TLS cluster
+        run: |
+          docker compose --env-file .env -f elk/l4-elasticsearch-cluster/docker-compose-elk-3node-cluster.yml up -d --wait --wait-timeout 900
+          docker compose --env-file .env -f elk/l4-elasticsearch-cluster/docker-compose-elk-3node-cluster.yml ps
+      - name: Smoke test (green 3-node cluster, TLS enforced, Logstash line searchable)
+        run: |
+          docker cp es01:/usr/share/elasticsearch/config/certs/ca/ca.crt "$RUNNER_TEMP/ca.crt"
+          ES_URL=https://localhost:9200 ES_CACERT="$RUNNER_TEMP/ca.crt" scripts/smoke-test.sh cluster
+      - name: Logs on failure
+        if: failure()
+        run: docker compose --env-file .env -f elk/l4-elasticsearch-cluster/docker-compose-elk-3node-cluster.yml logs --no-color --tail 200
+      - name: Tear down
+        if: always()
+        run: docker compose --env-file .env -f elk/l4-elasticsearch-cluster/docker-compose-elk-3node-cluster.yml down -v

@@ -1,0 +1,47 @@
+# Unit tests for the VRL pipeline in vector-vrl-transform-enrich.toml
+# Run: vector test vector-vrl-transform-enrich.toml vector-vrl-transform-enrich.tests.toml
+
+[[tests]]
+name = "json log line is parsed, normalised and PII-redacted"
+
+[[tests.inputs]]
+insert_at = "parse_raw"
+type = "log"
+[tests.inputs.log_fields]
+message = '{"time":"2026-10-26T10:00:00Z","severity":"WARNING","method":"get","status":"503","latency_ms":1500,"path":"/pay","password":"hunter2","note":"x"}'
+
+[[tests.outputs]]
+extract_from = "enrich_metadata"
+
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.log_level, "warn")
+  assert_eq!(.log_level_num, 40)
+  assert_eq!(.http.method, "GET")
+  assert_eq!(.http.status_code, 503)
+  assert!(.http.is_server_error)
+  assert!(.http.is_slow)
+  assert_eq!(.password, "[REDACTED]")
+  assert_eq!(.pipeline, "vector-vrl-enrich")
+'''
+
+[[tests]]
+name = "plain text line keeps its message and redacts e-mail addresses"
+
+[[tests.inputs]]
+insert_at = "parse_raw"
+type = "log"
+[tests.inputs.log_fields]
+message = "user alice@example.com failed login"
+
+[[tests.outputs]]
+extract_from = "enrich_metadata"
+
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.message, "user [REDACTED-EMAIL] failed login")
+  assert_eq!(.log_level, "info")
+  assert!(.timestamp_missing)
+'''

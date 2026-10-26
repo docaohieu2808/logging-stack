@@ -1,0 +1,26 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /fluentd
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker-compose
+    directory: /elk/l1-basic-elasticsearch-kibana
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker-compose
+    directory: /elk/l2-logstash-pipelines
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker-compose
+    directory: /elk/l4-elasticsearch-cluster
+    schedule:
+      interval: weekly
