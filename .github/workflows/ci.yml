@@ -124,6 +124,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: A throw-away CA file (the cluster pipeline checks that its CA path exists)
+        run: |
+          mkdir -p "$RUNNER_TEMP/certs/ca"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=ci-ca" \
+            -keyout "$RUNNER_TEMP/certs/ca/ca.key" -out "$RUNNER_TEMP/certs/ca/ca.crt"
+          chmod -R a+rX "$RUNNER_TEMP/certs"
       - name: logstash --config.test_and_exit (every pipeline)
         run: |
           for f in elk/l2-logstash-pipelines/logstash-pipeline-syslog.conf \
@@ -131,7 +137,7 @@ jobs:
                    elk/l4-elasticsearch-cluster/logstash-pipeline-cluster.conf; do
             echo "== $f"
             docker run --rm -e ELASTIC_PASSWORD=ci -e XPACK_MONITORING_ENABLED=false \
-              -v "$PWD/$f:/pipelines/test.conf:ro" "$LOGSTASH_IMAGE" \
+              -v "$PWD/$f:/pipelines/test.conf:ro" -v "$RUNNER_TEMP/certs:/usr/share/logstash/certs:ro" "$LOGSTASH_IMAGE" \
               logstash --path.data /tmp/ls-data --config.test_and_exit -f /pipelines/test.conf
           done
 

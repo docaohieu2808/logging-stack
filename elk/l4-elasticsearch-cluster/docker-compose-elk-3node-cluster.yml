@@ -44,9 +44,10 @@ services:
     command:
       - |
         set -euo pipefail
-        cd /usr/share/elasticsearch/config/certs
+        certs=/usr/share/elasticsearch/config/certs
+        cd "$$certs"
         if [ ! -f ca/ca.crt ]; then
-          /usr/share/elasticsearch/bin/elasticsearch-certutil ca --silent --pem -out ca.zip
+          /usr/share/elasticsearch/bin/elasticsearch-certutil ca --silent --pem -out "$$certs/ca.zip"
           unzip -q ca.zip
         fi
         if [ ! -f es01/es01.crt ]; then
@@ -55,7 +56,7 @@ services:
             '  - name: es02' '    dns: [es02, localhost]' '    ip: [127.0.0.1]' \
             '  - name: es03' '    dns: [es03, localhost]' '    ip: [127.0.0.1]' > instances.yml
           /usr/share/elasticsearch/bin/elasticsearch-certutil cert --silent --pem \
-            --in instances.yml --ca-cert ca/ca.crt --ca-key ca/ca.key -out certs.zip
+            --in "$$certs/instances.yml" --ca-cert "$$certs/ca/ca.crt" --ca-key "$$certs/ca/ca.key" -out "$$certs/certs.zip"
           unzip -q certs.zip
         fi
         chown -R 1000:0 .
