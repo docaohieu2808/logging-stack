@@ -199,7 +199,7 @@ services:
       test: ["CMD-SHELL", "curl -sf http://localhost:5601/api/status | grep -q '\"level\":\"available\"'"]
       interval: 10s
       timeout: 10s
-      retries: 40
+      retries: 90
       start_period: 40s
 
 volumes:
