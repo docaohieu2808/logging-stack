@@ -102,7 +102,7 @@ Ports are published on all interfaces: run the labs on a trusted machine or fire
 
 - Plain HTTP and default `changeme-*` passwords in the single-node labs: lab use only. l4 is the only level with TLS.
 - ILM `cold` phase only lowers priority. Real cold-tier savings need `searchable_snapshot`, which needs an Enterprise licence and a snapshot repository, so it is not in the policy. The old `freeze` action no longer exists.
-- S3 archiving (Fluentd l2, Vector l2/l3) is configured but not exercised in CI (no AWS account). The Fluentd S3 output has `check_bucket false` so the aggregator starts without AWS access; turn it on with real credentials.
+- S3 archiving (Fluentd l2, Vector l2/l3) is configured but not exercised in CI (no AWS account). The Fluentd S3 output has `check_bucket false`, `check_object false`, `check_apikey_on_start false` so the aggregator starts without AWS access; turn it on with real credentials.
 - The Ruby plugin skeletons in `l-max` are templates, not working plugins.
 - Fluent Bit reads Docker's `json-file` logs from `/var/lib/docker/containers` as root; the `systemd` input is commented out because it needs the host journal mounted.
 - Elasticsearch 8.19 is supported until 2027-07-15. To move to 9.x change the image tags together (Elasticsearch, Kibana, Logstash) and re-run the CI jobs.

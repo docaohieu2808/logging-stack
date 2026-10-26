@@ -16,11 +16,23 @@ updates:
     directory: /elk/l1-basic-elasticsearch-kibana
     schedule:
       interval: weekly
+    ignore:
+      # Elasticsearch, Kibana and Logstash must move to a new major together: do it by hand.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: docker-compose
     directory: /elk/l2-logstash-pipelines
     schedule:
       interval: weekly
+    ignore:
+      # Elasticsearch, Kibana and Logstash must move to a new major together: do it by hand.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: docker-compose
     directory: /elk/l4-elasticsearch-cluster
     schedule:
       interval: weekly
+    ignore:
+      # Elasticsearch, Kibana and Logstash must move to a new major together: do it by hand.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
