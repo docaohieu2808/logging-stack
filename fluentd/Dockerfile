@@ -1,7 +1,7 @@
 # Fluentd with the output plugins the l1/l2 configs need.
 # Fluentd is still maintained (CNCF graduated; v1.20.x); Fluent Bit (l3) is the
 # lightweight agent that replaces it on nodes, Fluentd stays useful as an aggregator.
-FROM fluent/fluentd:v1.20.1-debian-1.0
+FROM fluent/fluentd:v1.20.1-debian-1.1
 
 USER root
 # elasticsearch-ruby 9 sends Elasticsearch-9 compatibility headers that an 8.x server rejects (HTTP 400),
